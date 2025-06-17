@@ -1,9 +1,7 @@
-# === Optional Elevation Map Preview ===
 import rasterio
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-from mpl_toolkits.mplot3d import Axes3D
 import streamlit as st
 
 def show_elevation_map(tif_path: Path, processed_folder: Path):
@@ -14,15 +12,15 @@ def show_elevation_map(tif_path: Path, processed_folder: Path):
             transform = src.transform
             nodata = src.nodata
             
-        # Clean the data
+        # data cleaning stuff
         elevation = np.where(elevation == nodata, np.nan, elevation)
         elevation = np.where(elevation == 0, np.nan, elevation)
         
-        # Save processed numpy array
+        # save numpy array for later
         npy_path = processed_folder / tif_path.with_suffix(".npy").name
         np.save(npy_path, elevation)
         
-        # Show summary stats
+        # show summary for time pass
         st.subheader("Elevation Data Summary")
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -32,7 +30,7 @@ def show_elevation_map(tif_path: Path, processed_folder: Path):
         with col3:
             st.metric("Max Elevation", f"{np.nanmax(elevation):.0f} m")
         
-        # Create coordinate grids for mapping pixel coordinates to real-world coordinates
+        # create grid to map real-world cords
         rows, cols = elevation.shape
         left, top = transform * (0, 0)
         right, bottom = transform * (cols, rows)
@@ -41,7 +39,7 @@ def show_elevation_map(tif_path: Path, processed_folder: Path):
         lat = np.linspace(top, bottom, rows)
         lon_grid, lat_grid = np.meshgrid(lon, lat)
         
-        # Create 2D elevation map
+        # 2D map
         fig, ax = plt.subplots(figsize=(12, 8))
         im = ax.imshow(elevation, cmap="terrain", extent=[left, right, bottom, top], origin='upper')
         plt.colorbar(im, ax=ax, label="Elevation (meters)")
@@ -50,7 +48,7 @@ def show_elevation_map(tif_path: Path, processed_folder: Path):
         ax.set_ylabel("Latitude")
         st.pyplot(fig)
         
-        # Create 3D elevation surface with map coordinates
+        # 3D also cause it looks nice
         fig = plt.figure(figsize=(14, 10))
         ax = fig.add_subplot(111, projection='3d')
         surf = ax.plot_surface(lon_grid, lat_grid, elevation, cmap='terrain', linewidth=0, antialiased=False, alpha=0.95)
