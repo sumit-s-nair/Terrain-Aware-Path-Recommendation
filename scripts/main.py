@@ -11,8 +11,14 @@ EE_PROJECT = "rapid-462805"
 try:
     ee.Initialize(project=EE_PROJECT)
 except Exception as e:
-    st.error(f"Ohh Earth Engine failed to initialize its your fault definitely nothing wrong with the code, cause maybe you dont have the valid perms but heres the actual error anyway figure it out atb: {e}")
-    st.stop()
+    st.error("Ohh Earth Engine failed to initialize its your fault definitely nothing wrong with the code, cause maybe you dont have the valid perms but heres the actual error anyway figure it out atb:")
+    try:
+        ee.Authenticate()
+        ee.Initialize(project=EE_PROJECT)
+        st.success("Authentication successful! Please refresh the page.")
+    except Exception as auth_error:
+        st.error(f"Authentication failed. Please run 'earthengine authenticate' in your terminal first. Error: {auth_error}")
+        st.stop()
 
 # make folders if they don't exist
 EXPORT_FOLDER = Path(__file__).parent.parent / "data" / "raw"
