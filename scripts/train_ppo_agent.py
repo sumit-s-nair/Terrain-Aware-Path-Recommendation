@@ -91,7 +91,7 @@ def train_ppo_agent():
         ent_coef=0.01,
         vf_coef=0.5,
         max_grad_norm=0.5,
-        device="auto"
+        device="cpu"
     )
     
     # Create evaluation environment
