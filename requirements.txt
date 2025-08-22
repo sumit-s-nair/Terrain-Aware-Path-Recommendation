@@ -1,26 +1,16 @@
-# core stuff
-streamlit>=1.28.0
-numpy>=1.24.0
-matplotlib>=3.7.0
-scipy>=1.11.0
-
-# map stuff
-rasterio>=1.3.0
-geopy>=2.3.0
-
-# gee
-earthengine-api>=0.1.370
-
-# HTTP reqs
-requests>=2.31.0
-
-# Path handling stuff
-pathlib
-
-# Reinforcement Learning
-gymnasium>=0.29.0
-stable-baselines3>=2.0.0
-tensorboard>=2.12.0
-torch>=1.13.0
-tqdm
+numpy
+matplotlib
+gymnasium
+rasterio
+gpxpy
+pyproj
+requests
+scipy
+rioxarray
+stable-baselines3
 rich
+shapely
+geopandas
+py3dep
+pygeohydro
+tensorboard
