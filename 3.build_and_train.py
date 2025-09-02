@@ -59,50 +59,30 @@ class GPXExportCallback(BaseCallback):
         current_time = time.time()
         if self.num_timesteps % 1000 == 0 or (current_time - self.last_update_time) > 5:
             if self.progress_bar:
-                self.progress_bar.update(min(1000, self.progress_bar.total - self.progress_bar.n))
+                # Calculate how much to update progress bar
+                steps_to_update = min(1000, self.progress_bar.total - self.progress_bar.n)
+                if steps_to_update > 0:
+                    self.progress_bar.update(steps_to_update)
                 
-                # Get detailed info from environment
+                # Simple success tracking - just use our successful episodes count
                 try:
                     env = self.training_env
-                    if env and hasattr(env.envs[0], 'curriculum_successes'):
+                    if env and hasattr(env, 'envs') and hasattr(env.envs[0], 'curriculum_successes'):
                         # Curriculum learning info
                         successes = env.envs[0].curriculum_successes
                         attempts = max(1, env.envs[0].curriculum_attempts)
                         current_distance = env.envs[0].start_distance_meters
                         success_rate = successes / attempts * 100
                         
-                        # Current episode info
-                        current_pos = getattr(env.envs[0], 'current_pos', None)
-                        goal_pos = getattr(env.envs[0], 'goal', None)
-                        cell_size = getattr(env.envs[0], 'cell_size', 1.0)
-                        
-                        if current_pos is not None and goal_pos is not None:
-                            current_dist_to_goal = np.linalg.norm(current_pos - goal_pos) * cell_size
-                            episode_steps = getattr(env.envs[0], 'step_count', 0)
-                            
-                            # Get recent episode rewards from monitor
-                            monitor_path = "logs/monitor.csv"
-                            recent_reward = "N/A"
-                            if os.path.exists(monitor_path):
-                                try:
-                                    import pandas as pd
-                                    df = pd.read_csv(monitor_path, skiprows=1)
-                                    if len(df) > 0:
-                                        recent_reward = f"{df['r'].iloc[-1]:.0f}"
-                                except:
-                                    pass
-                            
-                            self.progress_bar.set_postfix_str(
-                                f"Success: {success_rate:.1f}% @ {current_distance:.0f}m | "
-                                f"Current: {current_dist_to_goal:.0f}m away, {episode_steps} steps | "
-                                f"Last reward: {recent_reward}"
-                            )
-                        else:
-                            self.progress_bar.set_postfix_str(f"Success: {success_rate:.1f}% @ {current_distance:.0f}m")
+                        self.progress_bar.set_postfix_str(
+                            f"Success: {success_rate:.1f}% @ {current_distance:.0f}m | "
+                            f"Total successes: {self.successful_episodes}"
+                        )
                     else:
-                        self.progress_bar.set_postfix_str(f"{self.successful_episodes} episodes")
+                        # Fallback to simple tracking
+                        self.progress_bar.set_postfix_str(f"Success: {self.successful_episodes} episodes")
                 except Exception as e:
-                    self.progress_bar.set_postfix_str(f"{self.successful_episodes} episodes")
+                    self.progress_bar.set_postfix_str(f"Success: {self.successful_episodes} episodes")
                 
             self.last_update_time = current_time
         
@@ -237,7 +217,7 @@ def make_env():
         auto_save_gpx=True,
         rng_seed=None,
         curriculum_learning=True,      # Enable curriculum learning
-        start_distance_meters=50.0,    # Start easier at 50m - give agent taste of success!
+        start_distance_meters=8.0,     # Start easier at 8m - give agent taste of success!
         include_goal_in_obs=True,      # Give agent goal direction info
     )
     
@@ -282,7 +262,7 @@ def main():
     print("🏔️ Starting ENHANCED training with FIXED reward structure...")
     print("- Rewards progress toward goal, not just proximity")
     print("- Penalizes resting when not at goal")  
-    print("- Uses curriculum learning starting at 50m distance (achievable start)")
+    print("- Uses curriculum learning starting at 8m distance (achievable start)")
     print("- NO STEP LIMITS - agent can take as long as needed to reach goal!")
     print("- Episodes end only on: goal reached, health depleted, or energy exhausted")
     print("- AGGRESSIVE curriculum progression (75% success, 2x DOUBLING)")
