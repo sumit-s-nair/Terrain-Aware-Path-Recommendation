@@ -313,12 +313,12 @@ class RealisticHikingEnv(gym.Env):
                 # Curriculum learning: start closer to goal, gradually increase distance
                 self.curriculum_attempts += 1
                 
-                # Calculate current curriculum distance based on success rate
+                # Much more conservative curriculum progression for sparse rewards
                 success_rate = self.curriculum_successes / max(1, self.curriculum_attempts)
-                if success_rate > 0.75 and self.curriculum_attempts > 10:  # More conservative advancement
-                    # If doing well, DOUBLE the difficulty for faster progression
-                    self.start_distance_meters = min(self.start_distance_meters * 2.0, 3748.0)  # Double distance!
-                    print(f"Curriculum: DOUBLED difficulty to {self.start_distance_meters:.0f}m from goal (success rate: {success_rate:.1%})")
+                if success_rate > 0.4 and self.curriculum_attempts > 20:  # Lower threshold, more attempts needed
+                    # If doing well, increase difficulty gradually for sparse rewards
+                    self.start_distance_meters = min(self.start_distance_meters * 1.5, 3748.0)  # 50% increase instead of doubling
+                    print(f"Curriculum: Increased difficulty to {self.start_distance_meters:.0f}m from goal (success rate: {success_rate:.1%})")
                     # Reset counters for new difficulty level
                     self.curriculum_successes = 0
                     self.curriculum_attempts = 0
@@ -355,11 +355,16 @@ class RealisticHikingEnv(gym.Env):
                 
                 actual_distance = np.linalg.norm(self.current_pos - self.goal) * self.cell_size
                 
-                # Adjust step limit based on actual distance
-                # Allow ~10 steps per meter of distance as a generous upper bound
-                min_steps = max(200, int(actual_distance * 10))  # at least 200 steps
-                if self.max_steps and self.max_steps < min_steps:
-                    print(f"Warning: Step limit ({self.max_steps}) may be too low for {actual_distance:.0f}m distance, recommend {min_steps}")
+                # VERY generous limits for sparse reward exploration
+                base_steps = 200   # Much higher base for sparse rewards
+                distance_steps = int(actual_distance * 15)  # 15 steps per meter - very generous
+                dynamic_step_limit = max(200, base_steps + distance_steps)  # Minimum 200 steps
+                
+                # Override max_steps with dynamic limit
+                old_limit = self.max_steps
+                self.max_steps = dynamic_step_limit
+                
+                print(f"🔧 Step limit: {self.max_steps} steps for {actual_distance:.0f}m ({actual_distance*15:.0f}+{base_steps})")
                 
                 if not hasattr(self, '_curriculum_info_printed') or self.curriculum_attempts % 100 == 0:
                     print(f"Curriculum: Starting {actual_distance:.0f}m from summit (target: {self.start_distance_meters:.0f}m)")
@@ -392,6 +397,9 @@ class RealisticHikingEnv(gym.Env):
         self.step_count = 0
         self.trajectory = [self.current_pos.copy()]
         
+        # ADD THIS LINE:
+        self._goal_reached_this_episode = False
+        
         # Action diversity tracking
         self.recent_actions = []  # Track last 20 actions for diversity bonus
         self.action_counts = np.zeros(9)  # Count of each action type
@@ -400,6 +408,21 @@ class RealisticHikingEnv(gym.Env):
 
     def step(self, action: int):
         self.step_count += 1
+        
+        # EMERGENCY STEP LIMIT CHECK - immediate termination
+        if self.max_steps is not None and self.step_count >= self.max_steps:
+            print(f"🚫 EMERGENCY STEP LIMIT TERMINATION at step {self.step_count} (limit: {self.max_steps})")
+            # Return immediately with massive penalty - DO NOT PROCESS MOVEMENT
+            return self._obs(), -5000.0, True, True, {
+                "result": "step_limit_exceeded", 
+                "reached_goal": False,
+                "step_limit_exceeded": True
+            }
+        
+        # DEBUG: Log step limit checking
+        if self.step_count % 50 == 0:
+            print(f"📊 Step {self.step_count}/{self.max_steps}")
+        
         prev = self.current_pos.copy()
 
         # 8-connected movement + rest
@@ -438,60 +461,57 @@ class RealisticHikingEnv(gym.Env):
 
         self.trajectory.append(self.current_pos.copy())
 
-        # ---- Reward (survival + goal + progress) ----
+        # ---- Anti-Farming Reward Structure ----
         reached = self._goal_reached()
         reward = 0.0
-        
-        # Goal reach bonus (MASSIVELY INCREASED)
-        if reached:
-            reward += 10000.0  # Increased from 1000.0 - make goal extremely attractive
+
+        # Track if this is the FIRST time reaching goal
+        if reached and not getattr(self, '_goal_reached_this_episode', False):
+            # ONLY reward goal the first time it's reached
+            reward += 1000.0  # Reduced but still significant
+            self._goal_reached_this_episode = True
+            print(f"🎯 GOAL REACHED for first time at step {self.step_count}!")
             # Track curriculum success
             if self.curriculum_learning:
                 self.curriculum_successes += 1
-            
-        # Death penalty (health only, energy system disabled)
+
+        # Death penalty
         if self.health <= 0.0:
-            reward -= 1000.0
-            
-        # Distance-based progress reward (HEAVILY INCREASED for goal motivation)
-        prev_dist = np.linalg.norm(prev - self.goal) * self.cell_size
+            reward -= 500.0
+
+        # Distance tracking (but NO progress rewards to prevent farming)
+        prev_dist = np.linalg.norm(prev - self.goal) * self.cell_size  
         cur_dist = np.linalg.norm(self.current_pos - self.goal) * self.cell_size
-        progress = prev_dist - cur_dist  # Positive = moving toward goal
-        
-        # Massive progress rewards to motivate goal-seeking behavior
-        reward += progress * 50.0  # 50x reward for every meter closer to goal
-        
-        # Additional distance-based shaping (closer = better base reward)
-        max_distance = 4000.0  # Approximate max distance on map
-        distance_bonus = (max_distance - cur_dist) / max_distance * 10.0  # 0-10 bonus based on closeness
-        reward += distance_bonus
-        
-        # Exponential bonus for getting very close to goal
-        if cur_dist < 500.0:  # Within 500m of summit
-            proximity_bonus = (500.0 - cur_dist) / 500.0 * 100.0  # 0-100 bonus
-            reward += proximity_bonus
-            
-        if cur_dist < 100.0:  # Within 100m of summit  
-            final_approach_bonus = (100.0 - cur_dist) / 100.0 * 500.0  # 0-500 bonus
-            reward += final_approach_bonus
-        
-        # Light penalties for unsafe moves (reduced to not discourage exploration)
+
+        # REMOVED: All progress-based rewards that enable farming
+        # The agent should only be motivated by reaching the goal and time pressure
+
+        # Strong time penalty - the ONLY ongoing negative reward
+        # This creates urgency without farmable positive rewards
+        time_penalty = 2.0 + (self.step_count * 0.1)  # Increases with time
+        reward -= time_penalty
+
+        # Small penalties for unsafe/inefficient moves
         if "slip" in result:
-            reward -= 2.0  # Reduced from 5.0
+            reward -= 5.0
         if "blocked" in result:
-            reward -= 0.5  # Reduced from 1.0
-            
-        # Very small time penalty (reduced to not discourage long journeys)
-        reward -= 0.001  # Reduced from 0.01
-            
-        # Alive shaping (encourage staying safe)
-        reward += (self.health / self.HEALTH_MAX)
+            reward -= 1.0
+
+        # Optional: Small penalty for being far from goal (non-farmable)
+        # This creates a weak but consistent pressure toward the goal
+        distance_pressure = min(10.0, cur_dist / 100.0)  # Capped at 10
+        reward -= distance_pressure
 
         # ---- Done flags ----
         terminated = reached or (self.health <= 0.0)  # Energy system disabled
         truncated = False
-        if self.max_steps is not None and self.step_count >= self.max_steps and not terminated:
-            truncated = True  # neutral truncation (we don't change reward)
+        
+        # DEBUG: Log step limit enforcement
+        if self.step_count % 50 == 0:  # Log every 50 steps
+            print(f"DEBUG: Step {self.step_count}/{self.max_steps}, dist={cur_dist:.1f}m")
+        
+        if terminated:
+            print(f"✅ TERMINATED at step {self.step_count} (goal reached: {reached}, step limit: {truncated})")
 
         info = {
             "result": result,

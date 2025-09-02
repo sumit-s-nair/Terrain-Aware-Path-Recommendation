@@ -165,5 +165,5 @@ models/checkpoints/
 # downloaded data
 dem_st_helens.tif
 data/processed/*
-
+training_output_physics/
 outputs/
