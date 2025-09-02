@@ -58,9 +58,23 @@ def preprocess():
 
     # ---- Slope calculation (in degrees) ----
     console.log("Calculating slope (degrees)...")
-    # gradients w.r.t actual meters: gradient returns dZ/dx (where x is in meters if we pass spacing)
-    # np.gradient expects spacing as the second arg: but we provide cell_size to scale.
-    dz_dy, dz_dx = np.gradient(dem_smooth, cell_size, cell_size)  # row (y), col (x)
+    # For geographic coordinates (EPSG:4326), need to convert degrees to meters
+    # At this latitude (~46°N), 1 degree longitude ≈ 69 km, 1 degree latitude ≈ 111 km
+    lat_center = 46.2  # Approximate latitude for Mt. St. Helens
+    meters_per_degree_lat = 111000  # meters per degree latitude
+    meters_per_degree_lon = 111000 * np.cos(np.radians(lat_center))  # adjust for latitude
+    
+    # Calculate ground distance per pixel
+    pixel_size_lat = abs(transform[4])  # degrees per pixel in Y direction
+    pixel_size_lon = abs(transform[0])  # degrees per pixel in X direction
+    
+    ground_distance_y = pixel_size_lat * meters_per_degree_lat  # meters per pixel Y
+    ground_distance_x = pixel_size_lon * meters_per_degree_lon  # meters per pixel X
+    
+    console.log(f"Ground resolution: {ground_distance_x:.1f}m x {ground_distance_y:.1f}m per pixel")
+    
+    # Calculate gradients with correct ground distances
+    dz_dy, dz_dx = np.gradient(dem_smooth, ground_distance_y, ground_distance_x)  # row (y), col (x)
     slope_rad = np.arctan(np.sqrt(dz_dx**2 + dz_dy**2))
     slope_deg = np.degrees(slope_rad).astype(np.float32)
 

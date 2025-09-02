@@ -165,3 +165,5 @@ models/checkpoints/
 # downloaded data
 dem_st_helens.tif
 data/processed/*
+
+outputs/

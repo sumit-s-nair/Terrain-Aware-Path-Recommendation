@@ -110,9 +110,18 @@ class RealisticHikingEnv(gym.Env):
             
             # Convert degrees to meters if DEM is in geographic coordinates (EPSG:4326)
             if src.crs.to_epsg() == 4326:
-                # At latitude ~46°N: 1 degree longitude ≈ 69,000m, 1 degree latitude ≈ 111,000m
-                # Use conservative estimate: ~80,000m per degree
-                self.cell_size = raw_cell_size * 80000  # degrees to meters conversion
+                # Convert geographic coordinates to ground distance
+                # St. Helens area is approximately 46.2°N latitude
+                latitude = 46.2
+                lat_rad = np.radians(latitude)
+                
+                # 1 degree longitude = cos(latitude) * 111,320 meters
+                # 1 degree latitude = 111,320 meters (constant)
+                meters_per_degree_lon = np.cos(lat_rad) * 111320
+                meters_per_degree_lat = 111320
+                
+                # Use longitude conversion (more conservative)
+                self.cell_size = raw_cell_size * meters_per_degree_lon
             else:
                 self.cell_size = raw_cell_size
 
@@ -306,25 +315,51 @@ class RealisticHikingEnv(gym.Env):
                 
                 # Calculate current curriculum distance based on success rate
                 success_rate = self.curriculum_successes / max(1, self.curriculum_attempts)
-                if success_rate > 0.8 and self.curriculum_attempts > 10:
-                    # If doing well, increase difficulty
-                    self.start_distance_meters = min(self.start_distance_meters * 1.2, 3748.0)
-                    print(f"Curriculum: Increased difficulty to {self.start_distance_meters:.0f}m from goal")
+                if success_rate > 0.75 and self.curriculum_attempts > 10:  # More conservative advancement
+                    # If doing well, DOUBLE the difficulty for faster progression
+                    self.start_distance_meters = min(self.start_distance_meters * 2.0, 3748.0)  # Double distance!
+                    print(f"Curriculum: DOUBLED difficulty to {self.start_distance_meters:.0f}m from goal (success rate: {success_rate:.1%})")
+                    # Reset counters for new difficulty level
+                    self.curriculum_successes = 0
+                    self.curriculum_attempts = 0
                 
                 # Find trail point approximately start_distance_meters from summit
                 target_distance_pixels = self.start_distance_meters / self.cell_size
-                best_idx = 0
-                best_distance_diff = float('inf')
                 
+                # Find all trail points within reasonable range of target distance
+                candidates = []
                 for i, trail_point in enumerate(self.trail_coords):
                     distance_to_summit = np.linalg.norm(trail_point - self.goal)
                     distance_diff = abs(distance_to_summit - target_distance_pixels)
-                    if distance_diff < best_distance_diff:
-                        best_distance_diff = distance_diff
-                        best_idx = i
+                    
+                    # Accept points within ±30% of target distance
+                    if distance_diff <= target_distance_pixels * 0.3:
+                        candidates.append((i, distance_diff))
+                
+                if candidates:
+                    # Randomly select from valid candidates to add variety
+                    best_idx = self.np_rng.choice([idx for idx, _ in candidates])
+                else:
+                    # Fallback: find closest trail point to target distance
+                    best_idx = 0
+                    best_distance_diff = float('inf')
+                    
+                    for i, trail_point in enumerate(self.trail_coords):
+                        distance_to_summit = np.linalg.norm(trail_point - self.goal)
+                        distance_diff = abs(distance_to_summit - target_distance_pixels)
+                        if distance_diff < best_distance_diff:
+                            best_distance_diff = distance_diff
+                            best_idx = i
                 
                 self.current_pos = self.trail_coords[best_idx].astype(np.float32)
+                
                 actual_distance = np.linalg.norm(self.current_pos - self.goal) * self.cell_size
+                
+                # Adjust step limit based on actual distance
+                # Allow ~10 steps per meter of distance as a generous upper bound
+                min_steps = max(200, int(actual_distance * 10))  # at least 200 steps
+                if self.max_steps and self.max_steps < min_steps:
+                    print(f"Warning: Step limit ({self.max_steps}) may be too low for {actual_distance:.0f}m distance, recommend {min_steps}")
                 
                 if not hasattr(self, '_curriculum_info_printed') or self.curriculum_attempts % 100 == 0:
                     print(f"Curriculum: Starting {actual_distance:.0f}m from summit (target: {self.start_distance_meters:.0f}m)")
@@ -356,6 +391,10 @@ class RealisticHikingEnv(gym.Env):
         self.health = self.HEALTH_MAX
         self.step_count = 0
         self.trajectory = [self.current_pos.copy()]
+        
+        # Action diversity tracking
+        self.recent_actions = []  # Track last 20 actions for diversity bonus
+        self.action_counts = np.zeros(9)  # Count of each action type
 
         return self._obs(), {}
 
