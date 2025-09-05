@@ -277,7 +277,7 @@ def main():
         gamma=0.995,         # Higher discount for longer episodes
         clip_range=0.2,
         gae_lambda=0.95,
-        ent_coef=0.25,       # Higher entropy for more exploration
+        ent_coef=0.35,       # INCREASED entropy for breaking wandering patterns
         vf_coef=0.5,
         max_grad_norm=0.5,
         tensorboard_log=str(OUTPUT_DIR / "tensorboard"),
@@ -286,18 +286,20 @@ def main():
     # -------------------------------
     # Training loop with progress tracking
     # -------------------------------
-    total_timesteps = 1_000_000  # Start with shorter training for validation
+    total_timesteps = 2_000_000  # Continue long training for curriculum progression
     callback = GPXExportCallback(verbose=1)
 
-    print("🏔️ Starting ANTI-FARMING training with VERY generous step limits...")
-    print("- Goal bonus ONLY awarded ONCE per episode (no farming)")
-    print("- NO progress-based rewards (eliminated farming opportunities)")
-    print("- Time penalty increases linearly: 2.0 + 0.1 * steps")
-    print("- Uses curriculum learning starting at 8m distance")
-    print("- VERY generous step limits: 200 base + 15 steps per meter distance")
-    print("- Episodes end on: goal reached, health depleted, energy exhausted, or step limit")
-    print("- CONSERVATIVE curriculum progression (40% success, 1.5x increase)")
-    print("- Real-time progress bar with success tracking")
+    print("🔧 Starting RECOVERY training to fix policy collapse...")
+    print("✅ IMPROVED REWARD SHAPING:")
+    print("- STRONGER progress bonuses (up to 5 points, lower threshold)")
+    print("- REDUCED backtracking penalties to allow exploration")
+    print("- INCREASED step limits (15-20 steps/m) for learning navigation")
+    print("- ADDED proximity bonus for getting closer to goal")
+    print()
+    print("🧠 LEARNING RECOVERY:")
+    print("- INCREASED exploration (ent_coef=0.35) to break wandering patterns")
+    print("- Curriculum progression with sliding window evaluation")
+    print("- Time-based advancement to prevent stalls")
     print(f"- Training for {total_timesteps:,} timesteps with enhanced exploration")
     
     model.learn(

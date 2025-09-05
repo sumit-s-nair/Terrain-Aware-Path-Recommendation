@@ -50,6 +50,9 @@ class RealisticHikingEnv(gym.Env):
         self.include_goal_in_obs = include_goal_in_obs
         self.curriculum_successes = 0  # Track successful goal reaches
         self.curriculum_attempts = 0   # Track total attempts
+        self.curriculum_window_size = 150  # Sliding window for success rate evaluation
+        self.curriculum_recent_results = []  # Store recent episode results (True/False)
+        self.curriculum_episodes_at_distance = 0  # Episodes spent at current distance
 
         # ---- Physics params (tuned) ----
         self.MAX_SAFE_SLOPE = 45.0        # deg baseline; eased by grip (increased from 35.0)
@@ -83,12 +86,12 @@ class RealisticHikingEnv(gym.Env):
         # ---- Gym spaces ----
         self.action_space = spaces.Discrete(9)  # 8 dirs + rest
         
-        # Base observation space
+        # Base observation space - SIMPLIFIED
         obs_dict = {
             "terrain_rgb": spaces.Box(
                 low=0, high=255, shape=(3, self.patch_size, self.patch_size), dtype=np.uint8
             ),
-            "physical_state": spaces.Box(low=-np.inf, high=np.inf, shape=(9,), dtype=np.float32),
+            "physical_state": spaces.Box(low=-np.inf, high=np.inf, shape=(6,), dtype=np.float32),  # Reduced from 9 to 6
         }
         
         # Add goal information if requested
@@ -253,19 +256,31 @@ class RealisticHikingEnv(gym.Env):
         patch[pr : pr + view.shape[0], pc : pc + view.shape[1]] = view
         terrain_rgb = patch.transpose(2, 0, 1)  # CHW
 
+        # SIMPLIFIED: Only essential state info + compass to goal
         cur_t = self._get_terrain_at(self.current_pos)
         dist_goal = np.linalg.norm(self.current_pos - self.goal) * self.cell_size
+        
+        # Calculate compass direction to goal (normalized)
+        goal_direction = self.goal - self.current_pos
+        goal_distance_pixels = np.linalg.norm(goal_direction)
+        if goal_distance_pixels > 0:
+            goal_direction_normalized = goal_direction / goal_distance_pixels
+        else:
+            goal_direction_normalized = np.array([0.0, 0.0])
+        
+        # Calculate compass bearing (0-360 degrees, 0=North)
+        compass_bearing = np.arctan2(goal_direction_normalized[1], goal_direction_normalized[0])
+        compass_bearing = np.degrees(compass_bearing) % 360  # Convert to 0-360 degrees
+        
+        # MINIMAL physical state: just position, goal compass, and distance
         physical = np.array(
             [
-                self.current_pos[0] / self.map_h,
-                self.current_pos[1] / self.map_w,
-                self.velocity[0],
-                self.velocity[1],
-                self.energy / self.ENERGY_MAX,
-                self.health / self.HEALTH_MAX,
-                cur_t["slope"] / 45.0,
-                cur_t["veg"] / 10.0,
-                dist_goal / 100.0,
+                self.current_pos[0] / self.map_h,  # Normalized position row
+                self.current_pos[1] / self.map_w,  # Normalized position col
+                goal_direction_normalized[0],      # Goal direction X (compass)
+                goal_direction_normalized[1],      # Goal direction Y (compass)
+                compass_bearing / 360.0,          # Compass bearing (0-1)
+                dist_goal / 1000.0,               # Distance to goal (normalized)
             ],
             dtype=np.float32,
         )
@@ -274,16 +289,10 @@ class RealisticHikingEnv(gym.Env):
         
         # Add goal information if requested
         if self.include_goal_in_obs:
-            # Goal direction and distance
-            goal_direction = self.goal - self.current_pos
-            goal_distance = np.linalg.norm(goal_direction)
-            if goal_distance > 0:
-                goal_direction = goal_direction / goal_distance  # Normalize
-            
             goal_info = np.array([
-                goal_direction[0],  # Normalized direction to goal (row)
-                goal_direction[1],  # Normalized direction to goal (col) 
-                dist_goal / 4000.0,  # Distance to goal (normalized)
+                goal_direction_normalized[0],  # Normalized direction to goal (row)
+                goal_direction_normalized[1],  # Normalized direction to goal (col) 
+                dist_goal / 4000.0,           # Distance to goal (normalized)
             ], dtype=np.float32)
             
             obs["goal_info"] = goal_info
@@ -312,16 +321,94 @@ class RealisticHikingEnv(gym.Env):
             if self.curriculum_learning:
                 # Curriculum learning: start closer to goal, gradually increase distance
                 self.curriculum_attempts += 1
+                self.curriculum_episodes_at_distance += 1
                 
-                # Much more conservative curriculum progression for sparse rewards
-                success_rate = self.curriculum_successes / max(1, self.curriculum_attempts)
-                if success_rate > 0.4 and self.curriculum_attempts > 20:  # Lower threshold, more attempts needed
-                    # If doing well, increase difficulty gradually for sparse rewards
-                    self.start_distance_meters = min(self.start_distance_meters * 1.5, 3748.0)  # 50% increase instead of doubling
-                    print(f"Curriculum: Increased difficulty to {self.start_distance_meters:.0f}m from goal (success rate: {success_rate:.1%})")
+                # Use sliding window for success rate calculation instead of cumulative
+                # This allows the agent to "recover" from initial poor performance
+                recent_window = self.curriculum_recent_results[-self.curriculum_window_size:]
+                if len(recent_window) >= 50:  # Need minimum episodes for meaningful rate
+                    success_rate = sum(recent_window) / len(recent_window)
+                else:
+                    # Fallback to cumulative for very early training
+                    success_rate = self.curriculum_successes / max(1, self.curriculum_attempts)
+                
+                # IMPROVED CURRICULUM THRESHOLDS: Better reward structure allows higher standards
+                current_start_distance_km = self.start_distance_meters / 1000.0
+                
+                if current_start_distance_km < 0.02:  # Under 20m - expect good performance on trivial distances
+                    required_success_rate = 0.50  # 50% for very close starts (up from 35%)
+                    min_attempts = 50
+                elif current_start_distance_km < 0.05:  # 20-50m - basic pathfinding
+                    required_success_rate = 0.40  # 40% for short starts (up from 30%) 
+                    min_attempts = 75
+                elif current_start_distance_km < 0.5:  # 50m-500m - meaningful pathfinding
+                    required_success_rate = 0.35  # 35% for moderate distances
+                    min_attempts = 100
+                elif current_start_distance_km < 5.0:  # 0.5-5km - challenging pathfinding
+                    required_success_rate = 0.25  # 25% for long distances
+                    min_attempts = 125
+                else:  # 5km+ - expert pathfinding
+                    required_success_rate = 0.20  # 20% for very long distances
+                    min_attempts = 150
+                
+                # Time-based advancement: force progression after many episodes to prevent getting stuck
+                force_advancement = self.curriculum_episodes_at_distance >= 500
+                
+                # ROLLBACK MECHANISM: If struggling for too long, step back to easier distance
+                force_rollback = (
+                    self.curriculum_episodes_at_distance >= 200 and 
+                    success_rate < (required_success_rate * 0.6) and  # Success rate < 60% of requirement
+                    self.start_distance_meters > 8  # Don't roll back below starting distance
+                )
+                
+                advancement_condition = (
+                    (success_rate >= required_success_rate and self.curriculum_attempts >= min_attempts) or
+                    force_advancement
+                )
+                
+                if force_rollback:
+                    old_distance = self.start_distance_meters
+                    # Step back by ~30%
+                    self.start_distance_meters = max(8.0, self.start_distance_meters * 0.7)
+                    print(f"📉 Curriculum ROLLBACK {old_distance:.0f}m → {self.start_distance_meters:.0f}m (struggling, success rate: {success_rate:.1%})")
+                    
+                    # Reset counters for easier difficulty level
+                    self.curriculum_successes = 0
+                    self.curriculum_attempts = 0
+                    self.curriculum_episodes_at_distance = 0
+                    self.curriculum_recent_results.clear()
+                    
+                elif advancement_condition:
+                    old_distance = self.start_distance_meters
+                    
+                    # 🚀 AGGRESSIVE PROGRESSION: Big jumps to reach full 32km trail quickly!
+                    if self.start_distance_meters < 50:
+                        self.start_distance_meters = 50.0    # 8-20m → 50m (huge jump!)
+                    elif self.start_distance_meters < 150:
+                        self.start_distance_meters = 150.0   # 50m → 150m (3x jump)
+                    elif self.start_distance_meters < 500:
+                        self.start_distance_meters = 500.0   # 150m → 500m (3.3x jump)
+                    elif self.start_distance_meters < 1500:
+                        self.start_distance_meters = 1500.0  # 500m → 1.5km (3x jump)
+                    elif self.start_distance_meters < 5000:
+                        self.start_distance_meters = 5000.0  # 1.5km → 5km (3.3x jump)
+                    elif self.start_distance_meters < 15000:
+                        self.start_distance_meters = 15000.0 # 5km → 15km (3x jump)
+                    elif self.start_distance_meters < 32000:
+                        self.start_distance_meters = 32000.0 # 15km → FULL TRAIL (32km)
+                    else:
+                        # Already at full trail - maintain maximum challenge
+                        self.start_distance_meters = 32000.0  # Full trail distance
+                    
+                    advancement_reason = "performance" if not force_advancement else "time-based"
+                    print(f"🎯 Curriculum ADVANCED {old_distance:.0f}m → {self.start_distance_meters:.0f}m ({advancement_reason}, success rate: {success_rate:.1%})")
+                    
                     # Reset counters for new difficulty level
                     self.curriculum_successes = 0
                     self.curriculum_attempts = 0
+                    self.curriculum_episodes_at_distance = 0
+                    # Keep recent results but mark this transition
+                    self.curriculum_recent_results.clear()
                 
                 # Find trail point approximately start_distance_meters from summit
                 target_distance_pixels = self.start_distance_meters / self.cell_size
@@ -355,20 +442,38 @@ class RealisticHikingEnv(gym.Env):
                 
                 actual_distance = np.linalg.norm(self.current_pos - self.goal) * self.cell_size
                 
-                # VERY generous limits for sparse reward exploration
-                base_steps = 200   # Much higher base for sparse rewards
-                distance_steps = int(actual_distance * 15)  # 15 steps per meter - very generous
-                dynamic_step_limit = max(200, base_steps + distance_steps)  # Minimum 200 steps
+                # INCREASED step limits to allow more exploration and learning
+                # Scale based on distance but more generous to help agent learn navigation
+                if actual_distance < 50:  # Close range: generous limits for learning
+                    steps_per_meter = 15  # Increased from 8 - allow exploration
+                    base_steps = 200  # Increased from 100 - more time to learn
+                elif actual_distance < 200:  # Medium range: moderate limits  
+                    steps_per_meter = 18  # Increased from 10 - help with navigation
+                    base_steps = 250  # Increased from 120 - learning phase
+                else:  # Long range: very generous for complex navigation
+                    steps_per_meter = 20  # Increased from 12 - complex pathfinding
+                    base_steps = 300  # Increased from 150 - challenging distances
+                
+                distance_steps = int(actual_distance * steps_per_meter)
+                dynamic_step_limit = max(base_steps, base_steps + distance_steps)
                 
                 # Override max_steps with dynamic limit
                 old_limit = self.max_steps
                 self.max_steps = dynamic_step_limit
                 
-                print(f"🔧 Step limit: {self.max_steps} steps for {actual_distance:.0f}m ({actual_distance*15:.0f}+{base_steps})")
+                print(f"🔧 Step limit: {self.max_steps} steps for {actual_distance:.0f}m ({distance_steps}+{base_steps}, {steps_per_meter} steps/m)")
                 
                 if not hasattr(self, '_curriculum_info_printed') or self.curriculum_attempts % 100 == 0:
-                    print(f"Curriculum: Starting {actual_distance:.0f}m from summit (target: {self.start_distance_meters:.0f}m)")
-                    print(f"Success rate: {success_rate:.2f} ({self.curriculum_successes}/{self.curriculum_attempts})")
+                    # Calculate sliding window success rate for display
+                    recent_window = self.curriculum_recent_results[-self.curriculum_window_size:]
+                    if len(recent_window) >= 10:
+                        recent_success_rate = sum(recent_window) / len(recent_window)
+                        print(f"Curriculum: Starting {actual_distance:.0f}m from summit (target: {self.start_distance_meters:.0f}m)")
+                        print(f"Success rate - Recent: {recent_success_rate:.2f} ({sum(recent_window)}/{len(recent_window)}), Cumulative: {success_rate:.2f} ({self.curriculum_successes}/{self.curriculum_attempts})")
+                        print(f"Episodes at {self.start_distance_meters:.0f}m: {self.curriculum_episodes_at_distance}")
+                    else:
+                        print(f"Curriculum: Starting {actual_distance:.0f}m from summit (target: {self.start_distance_meters:.0f}m)")
+                        print(f"Success rate: {success_rate:.2f} ({self.curriculum_successes}/{self.curriculum_attempts}) - building window...")
                     self._curriculum_info_printed = True
             else:
                 # Standard training: start at trailhead
@@ -446,6 +551,13 @@ class RealisticHikingEnv(gym.Env):
             d = np.array(dirs[action_idx], dtype=np.float32)
             intended = self.current_pos + d
 
+            # Track action diversity for reward calculation
+            if not hasattr(self, 'recent_actions'):
+                self.recent_actions = []
+            self.recent_actions.append(action_idx)
+            if len(self.recent_actions) > 10:
+                self.recent_actions.pop(0)
+
             valid, reason = self._movement_is_valid(self.current_pos, intended)
             if valid:
                 nxt, slip_state = self._apply_slip_if_needed(intended)
@@ -461,50 +573,126 @@ class RealisticHikingEnv(gym.Env):
 
         self.trajectory.append(self.current_pos.copy())
 
-        # ---- Anti-Farming Reward Structure ----
+        # ---- PATHFINDING-OPTIMIZED REWARD ENGINEERING ----
+        # Based on RL research: "expert knowledge often required to design adequate reward function"
+        # Key insights: shaped rewards, meaningful distance thresholds, efficiency metrics
+        
         reached = self._goal_reached()
         reward = 0.0
+        initial_distance = self.start_distance_meters  # Store for consistent reference
+        
+        # Current and previous distances from goal (in meters)
+        prev_dist = np.linalg.norm(prev - self.goal) * self.cell_size  
+        cur_dist = np.linalg.norm(self.current_pos - self.goal) * self.cell_size
+        distance_change = prev_dist - cur_dist  # Positive = getting closer
 
-        # Track if this is the FIRST time reaching goal
+        # Track if this is the FIRST time reaching goal this episode
         if reached and not getattr(self, '_goal_reached_this_episode', False):
-            # ONLY reward goal the first time it's reached
-            reward += 1000.0  # Reduced but still significant
+            # 🎯 SCALED GOAL REWARD: Success reward proportional to challenge difficulty
+            # Far starts deserve much higher rewards than trivial 8m "successes"
+            initial_distance = self.start_distance_meters
+            
+            if initial_distance >= 30000:  # 30km+ - epic achievement
+                goal_reward = 5000.0
+            elif initial_distance >= 15000:  # 15-30km - major achievement  
+                goal_reward = 3000.0
+            elif initial_distance >= 5000:  # 5-15km - significant achievement
+                goal_reward = 2000.0
+            elif initial_distance >= 1000:  # 1-5km - moderate achievement
+                goal_reward = 1500.0
+            elif initial_distance >= 500:  # 0.5-1km - minor achievement
+                goal_reward = 1000.0
+            elif initial_distance >= 100:  # 100-500m - basic achievement
+                goal_reward = 500.0
+            elif initial_distance >= 50:   # 50-100m - trivial achievement
+                goal_reward = 200.0
+            else:  # Under 50m - barely counts as pathfinding
+                goal_reward = 50.0   # Minimal reward for trivial distances
+            
+            reward += goal_reward
             self._goal_reached_this_episode = True
-            print(f"🎯 GOAL REACHED for first time at step {self.step_count}!")
+            print(f"� GOAL REACHED! Distance: {initial_distance:.0f}m → Reward: {goal_reward:.0f} at step {self.step_count}")
+            
             # Track curriculum success
             if self.curriculum_learning:
                 self.curriculum_successes += 1
 
-        # Death penalty
-        if self.health <= 0.0:
-            reward -= 500.0
-
-        # Distance tracking (but NO progress rewards to prevent farming)
-        prev_dist = np.linalg.norm(prev - self.goal) * self.cell_size  
-        cur_dist = np.linalg.norm(self.current_pos - self.goal) * self.cell_size
-
-        # REMOVED: All progress-based rewards that enable farming
-        # The agent should only be motivated by reaching the goal and time pressure
-
-        # Strong time penalty - the ONLY ongoing negative reward
-        # This creates urgency without farmable positive rewards
-        time_penalty = 2.0 + (self.step_count * 0.1)  # Increases with time
+        # 💀 Death penalty (reasonable but not excessive)
+        elif self.health <= 0.0:
+            reward -= 200.0  # Balanced death penalty
+        
+        # 🧭 NAVIGATION EFFICIENCY REWARDS (for alive, non-goal states)
+        if not reached and self.health > 0.0:
+            initial_distance = self.start_distance_meters
+            
+            # 1. SMART PROGRESS BONUS: More bonus for longer challenges
+            if distance_change > 0.5:  # Meaningful progress (>0.5m toward goal)
+                # Scale progress bonus by remaining challenge - harder targets get more bonus
+                progress_scale = min(2.0, cur_dist / 1000.0)  # More bonus for longer distances
+                progress_bonus = min(3.0, distance_change * (0.3 + progress_scale * 0.2))
+                reward += progress_bonus
+            
+            # 1a. ACTION DIVERSITY BONUS: Encourage sophisticated navigation
+            # Reward using different actions to navigate around obstacles
+            if hasattr(self, 'recent_actions') and len(self.recent_actions) >= 5:
+                unique_actions = len(set(self.recent_actions[-5:]))
+                if unique_actions >= 3:  # Used at least 3 different actions recently
+                    diversity_bonus = 0.4 * (unique_actions / 8.0)  # Max bonus for using all 8 directions
+                    reward += diversity_bonus
+            
+            # 1b. STUCK PENALTY: Penalize repeatedly using same action when not making progress
+            if hasattr(self, 'recent_actions') and len(self.recent_actions) >= 3:
+                if len(set(self.recent_actions[-3:])) == 1:  # Same action 3 times in a row
+                    if distance_change <= 0:  # And not making progress
+                        stuck_penalty = 0.5
+                        reward -= stuck_penalty
+            
+            # 2. COMPASS ALIGNMENT BONUS: Reward following compass bearing efficiently
+            goal_vector = self.goal - self.current_pos
+            goal_distance = np.linalg.norm(goal_vector)
+            if goal_distance > 0:
+                goal_bearing = np.arctan2(goal_vector[1], goal_vector[0])  # Radians
+                # Get compass bearing from physical state (index 4 in compass bearing 0-1)
+                obs_data = self._obs()
+                current_bearing = obs_data["physical_state"][4] * 2 * np.pi  # Convert back to radians
+                
+                # Calculate bearing difference (handle wrap-around)
+                bearing_diff = abs(goal_bearing - current_bearing)
+                bearing_diff = min(bearing_diff, 2 * np.pi - bearing_diff)
+                
+                # Bonus for good compass alignment (bearing within 45 degrees)
+                if bearing_diff < np.pi/4:  # Within 45 degrees
+                    alignment_bonus = 0.5 * (1.0 - bearing_diff/(np.pi/4))
+                    reward += alignment_bonus
+            
+            # 3. EFFICIENCY PENALTY: Discourage excessive wandering
+            if initial_distance > 0 and len(self.trajectory) > 10:
+                efficiency_ratio = len(self.trajectory) * self.cell_size / initial_distance
+                if efficiency_ratio > 2.0:  # Path more than 2x direct distance
+                    inefficiency_penalty = min(1.0, (efficiency_ratio - 2.0) * 0.2)
+                    reward -= inefficiency_penalty
+        
+        # ⏰ ADAPTIVE TIME PENALTY: Scale time pressure with challenge difficulty
+        if initial_distance >= 1000:  # 1km+ gets generous time budget
+            time_penalty = 0.02
+        elif initial_distance >= 100:  # 100m-1km gets moderate time pressure
+            time_penalty = 0.05
+        else:  # Under 100m gets stronger time pressure (should be quick)
+            time_penalty = 0.1
+        
         reward -= time_penalty
-
-        # Small penalties for unsafe/inefficient moves
-        if "slip" in result:
-            reward -= 5.0
-        if "blocked" in result:
-            reward -= 1.0
-
-        # Optional: Small penalty for being far from goal (non-farmable)
-        # This creates a weak but consistent pressure toward the goal
-        distance_pressure = min(10.0, cur_dist / 100.0)  # Capped at 10
-        reward -= distance_pressure
 
         # ---- Done flags ----
         terminated = reached or (self.health <= 0.0)  # Energy system disabled
         truncated = False
+        
+        # Track episode result for sliding window curriculum evaluation
+        if terminated and self.curriculum_learning:
+            # Add this episode's result to the sliding window
+            self.curriculum_recent_results.append(bool(reached))
+            # Keep only the most recent results within window size
+            if len(self.curriculum_recent_results) > self.curriculum_window_size:
+                self.curriculum_recent_results.pop(0)
         
         # DEBUG: Log step limit enforcement
         if self.step_count % 50 == 0:  # Log every 50 steps
